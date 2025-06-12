@@ -1,158 +1,214 @@
 import os
-import shutil
+import win32api
+import win32file
+import wmi
 import subprocess
 import tkinter as tk
 from tkinter import ttk, messagebox
-import win32com.client
+import threading
+import sys
+import ctypes
 
-
-def obtener_modelo_discos():
-    """
-    Obtiene información de los discos físicos y los enlaza con sus letras.
-    """
-    discos_info = {}  # Diccionario para almacenar modelo y tamaño de cada disco
+# 1. Identificación precisa de discos físicos
+def obtener_discos_fisicos():
+    """Obtiene discos físicos con sus índices, modelos y tamaños"""
+    discos = []
     try:
-        wmi = win32com.client.Dispatch("WbemScripting.SWbemLocator")  # Inicializa el cliente WMI
-        servicio = wmi.ConnectServer(".", "root\\cimv2")  # Conecta al servicio WMI local
-        discos = servicio.ExecQuery("SELECT * FROM Win32_DiskDrive")  # Consulta todos los discos físicos
-
-        for disco in discos:  # Itera sobre cada disco encontrado
-            modelo = disco.Model  # Obtiene el modelo del disco
-            size = disco.Size  # Obtiene el tamaño en bytes
-            if size:
-                tamaño_gb = int(size) / (1024**3)  # Convierte el tamaño a GB
-                discos_info[modelo] = f"{tamaño_gb:.2f} GB"  # Guarda modelo y tamaño en el diccionario
+        conexion = wmi.WMI()
+        for fisico in conexion.Win32_DiskDrive():
+            discos.append({
+                'indice': fisico.Index,
+                'modelo': fisico.Model,
+                'tamaño': int(fisico.Size),
+                'interfaz': fisico.InterfaceType,
+                'particiones': []
+            })
     except Exception as e:
-        print(f"Error obteniendo información de los discos: {e}")  # Muestra error si ocurre
-    return discos_info  # Devuelve el diccionario con la información de los discos
+        print(f"Error obteniendo discos físicos: {e}")
+    return discos
 
+# 2. Detectar particiones de cada disco
+def obtener_particiones():
+    """Obtiene información de particiones y las relaciona con discos físicos"""
+    discos = obtener_discos_fisicos()
+    try:
+        conexion = wmi.WMI()
 
-def listar_discos_con_detalles():
+        for logica in conexion.Win32_LogicalDisk(DriveType=3):
+            # Verifica que logica tenga DiskIndex
+            if not hasattr(logica, "DiskIndex"):
+                continue
+            for disco in discos:
+                if disco['indice'] == logica.DiskIndex:
+                    disco['particiones'].append({
+                        'letra': logica.DeviceID,
+                        'tamaño': int(logica.Size),
+                        'libre': int(logica.FreeSpace)
+                    })
+
+    except Exception as e:
+        print(f"Error obteniendo particiones: {e!r}")
+    return discos
+
+# 3. Clonación real con herramienta externa (requiere ejecutar como administrador)
+def clonar_disco(origen_idx, destino_idx):
     """
-    Lista las unidades disponibles con su letra, tamaño y modelo.
-    """
-    discos = []  # Lista para almacenar la información de cada unidad
-    modelos = obtener_modelo_discos()  # Obtiene los modelos y tamaños de los discos físicos
-
-    for letra in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":  # Itera sobre todas las posibles letras de unidad
-        ruta = f"{letra}:\\"  # Construye la ruta de la unidad
-        if os.path.exists(ruta):  # Verifica si la unidad existe
-            try:
-                total, _, _ = shutil.disk_usage(ruta)  # Obtiene el tamaño total de la unidad
-                tamaño_gb = total / (1024**3)  # Convierte el tamaño a GB
-                # Busca el modelo cuyo tamaño coincide aproximadamente con el de la unidad
-                modelo = next((key for key, value in modelos.items() if f"{tamaño_gb:.0f}" in value), "Desconocido")
-                discos.append(f"{ruta} - {modelo} - {tamaño_gb:.2f} GB")  # Agrega la info a la lista
-            except Exception as e:
-                discos.append(f"{ruta} - Modelo desconocido - Tamaño desconocido")  # Si hay error, agrega como desconocido
-    return discos  # Devuelve la lista de discos con detalles
-
-
-def clonar_disco(origen, destino):
-    """
-    Clona un disco de origen a un destino usando el comando diskpart.
+    Clona usando herramienta de bajo nivel (ej. dd para Windows)
+    Requiere: https://chrysocome.net/dd
     """
     try:
-        # Verificamos que el origen y destino sean válidos
-        if not origen or not destino:
-            messagebox.showwarning("Advertencia", "Debe seleccionar discos válidos.")  # Muestra advertencia si faltan datos
-            return
-
-        # Extraemos las letras de las unidades seleccionadas
-        origen_letra = origen.split(" - ")[0].strip(":\\")  # Obtiene la letra del disco origen
-        destino_letra = destino.split(" - ")[0].strip(":\\")  # Obtiene la letra del disco destino
-        
-        # Confirmación antes de clonar
-        respuesta = messagebox.askyesno(
-            "Confirmación",
-            f"¿Está seguro de clonar {origen} a {destino}? Esto borrará todos los datos del destino."
+        comando = f"dd if=\\.\\PhysicalDrive{origen_idx} of=\\.\\PhysicalDrive{destino_idx} bs=1M --progress"
+        proceso = subprocess.Popen(
+            comando,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            universal_newlines=True
         )
-        if not respuesta:
-            return  # Si el usuario cancela, no hace nada
-
-        # Crear un archivo temporario de script para diskpart
-        script_path = "clonar_disco.txt"  # Nombre del archivo temporal
-        with open(script_path, "w") as script:  # Abre el archivo para escribir el script
-            script.write(f"select volume {origen_letra}\n")  # Selecciona el volumen origen
-            script.write(f"clean\n")  # Limpia el disco destino (¡peligroso!)
-            script.write(f"create partition primary\n")  # Crea una partición primaria
-            script.write(f"format fs=ntfs quick\n")  # Formatea la partición como NTFS rápido
-            script.write(f"assign letter={destino_letra}\n")  # Asigna la letra al destino
-            script.write(f"exit\n")  # Sale de diskpart
-
-        # Ejecutar el comando diskpart con el script y capturar la salida
-        result = subprocess.run(["diskpart", "/s", script_path], check=True, capture_output=True, text=True)
-
-        # Verificar la salida de diskpart
-        if result.returncode != 0:
-            messagebox.showerror("Error", f"Error en diskpart: {result.stderr}")  # Muestra error si falla
-        else:
-            messagebox.showinfo("Éxito", f"Disco clonado de {origen} a {destino}.")  # Muestra éxito
-
-        # Eliminar el archivo de script
-        os.remove(script_path)  # Borra el archivo temporal
-    except subprocess.CalledProcessError as e:
-        messagebox.showerror("Error", f"No se pudo completar la clonación: {e}")  # Error específico de subprocess
+        
+        # Leer salida en tiempo real
+        while True:
+            salida = proceso.stdout.readline()
+            if salida == '' and proceso.poll() is not None:
+                break
+            if salida:
+                print(salida.strip())
+        
+        if proceso.returncode != 0:
+            raise subprocess.CalledProcessError(proceso.returncode, comando)
+            
     except Exception as e:
-        messagebox.showerror("Error", f"Error inesperado: {e}")  # Otros errores inesperados
+        raise Exception(f"Error en clonación: {e}")
 
-
+# 4. Interfaz mejorada
 def crear_interfaz():
-    # Función interna para actualizar la lista de discos en los combobox
-    def actualizar_discos():
-        discos = listar_discos_con_detalles()  # Obtiene la lista de discos
-        if discos:
-            lista_origen["values"] = discos  # Actualiza el combobox de origen
-            lista_destino["values"] = discos  # Actualiza el combobox de destino
-        else:
-            messagebox.showinfo("Sin discos", "No se encontraron discos disponibles.")  # Muestra mensaje si no hay discos
-
-    # Función interna para iniciar la clonación al presionar el botón
+    def actualizar_listas():
+        discos = obtener_particiones()
+        lista_origen['values'] = [
+            f"Disco {d['indice']}: {d['modelo']} ({d['tamaño']//(1024**3)}GB)" 
+            for d in discos
+        ]
+        lista_destino['values'] = lista_origen['values']
+    
     def iniciar_clonacion():
-        origen = lista_origen.get()  # Obtiene el disco de origen seleccionado
-        destino = lista_destino.get()  # Obtiene el disco de destino seleccionado
-        clonar_disco(origen, destino)  # Llama a la función de clonación
+        origen = lista_origen.get()
+        destino = lista_destino.get()
+        
+        if not origen or not destino:
+            messagebox.showwarning("Error", "Seleccione ambos discos")
+            return
+            
+        origen_idx = int(origen.split()[1][:-1])
+        destino_idx = int(destino.split()[1][:-1])
+        
+        # Confirmación crítica
+        confirm = messagebox.askyesno(
+            "¡ADVERTENCIA!",
+            f"¿Clonar DISCO {origen_idx} a DISCO {destino_idx}?\n"
+            f"¡TODOS LOS DATOS EN EL DESTINO SERÁN DESTRUIDOS!",
+            icon='warning'
+        )
+        if not confirm:
+            return
+        
+        # Ejecutar en hilo separado para no bloquear la GUI
+        def tarea_clonacion():
+            try:
+                btn_clonar.config(state=tk.DISABLED)
+                clonar_disco(origen_idx, destino_idx)
+                messagebox.showinfo("Éxito", "Clonación completada")
+            except Exception as e:
+                messagebox.showerror("Error", str(e))
+            finally:
+                btn_clonar.config(state=tk.NORMAL)
+        
+        threading.Thread(target=tarea_clonacion, daemon=True).start()
 
-    ventana = tk.Tk()  # Crea la ventana principal de Tkinter
-    ventana.title("Clonación de Discos")  # Título de la ventana
-    ventana.geometry("600x400")  # Tamaño de la ventana
-    ventana.config(bg="#f0f0f0")  # Fondo gris claro para la ventana
+    # Configuración de ventana
+    ventana = tk.Tk()
+    ventana.title("Clonador de Discos - Admin")
+    ventana.geometry("560x370")
+    ventana.resizable(False, False)
+    try:
+        ventana.iconbitmap("icon.ico")
+    except Exception:
+        pass
 
-    # Título
-    titulo_label = tk.Label(ventana, text="Clonación de Discos", font=("Arial", 20, "bold"), bg="#f0f0f0")
-    titulo_label.pack(pady=20)  # Muestra el título con espacio vertical
+    # Estilo ttk mejorado
+    style = ttk.Style()
+    style.theme_use('clam')
+    style.configure('TLabel', font=('Segoe UI', 12))
+    style.configure('TButton', font=('Segoe UI', 12), padding=8)
+    style.configure('TCombobox', font=('Segoe UI', 12), padding=4)
+    style.configure('Header.TLabel', font=('Segoe UI', 16, 'bold'))
+    style.configure('Warning.TLabel', font=('Segoe UI', 11, 'bold'), foreground='red')
+    # Botón verde personalizado
+    style.configure('Green.TButton', font=('Segoe UI', 12), padding=8, background='#4CAF50', foreground='white')
+    style.map('Green.TButton',
+              background=[('active', '#45a049'), ('!active', '#4CAF50')],
+              foreground=[('disabled', '#cccccc'), ('!disabled', 'white')])
 
-    # Marco para los combos de origen y destino
-    frame_discos = tk.Frame(ventana, bg="#f0f0f0")
-    frame_discos.pack(pady=20)  # Añade espacio vertical
+    ventana.configure(bg="#f5f5f5")
 
-    tk.Label(frame_discos, text="Seleccione el disco de origen:", font=("Arial", 12), bg="#f0f0f0").pack(pady=5)
-    lista_origen = ttk.Combobox(frame_discos, state="readonly", width=50, font=("Arial", 12))
-    lista_origen.pack(pady=5)  # Combobox para seleccionar disco de origen
+    frame = ttk.Frame(ventana, padding=30, style='My.TFrame')
+    frame.pack(expand=True, fill='both')
+    style.configure('My.TFrame', background="#f5f5f5")
 
-    tk.Label(frame_discos, text="Seleccione el disco de destino:", font=("Arial", 12), bg="#f0f0f0").pack(pady=5)
-    lista_destino = ttk.Combobox(frame_discos, state="readonly", width=50, font=("Arial", 12))
-    lista_destino.pack(pady=5)  # Combobox para seleccionar disco de destino
+    # Encabezado
+    ttk.Label(frame, text="Clonador de Discos", style='Header.TLabel', anchor='center').grid(row=0, column=0, columnspan=2, pady=(0, 20), sticky='ew')
 
-    # Llenar los combobox al iniciar la ventana
-    actualizar_discos()
-    # Botones
-    frame_boton = tk.Frame(ventana, bg="#f0f0f0")
-    frame_boton.pack(pady=20)  # Añade espacio vertical
+    # Disco Origen
+    ttk.Label(frame, text="Disco Origen:").grid(row=1, column=0, sticky='e', pady=10, padx=10)
+    lista_origen = ttk.Combobox(frame, width=55, state="readonly")
+    lista_origen.grid(row=1, column=1, pady=10, padx=10, sticky='w')
 
-    actualizar_button = tk.Button(
-        frame_boton, text="Actualizar Discos", command=actualizar_discos,
-        width=20, font=("Arial", 12), bg="#4CAF50", fg="white", relief="flat"
-    )
-    actualizar_button.pack(pady=10)  # Botón para actualizar la lista de discos
+    # Disco Destino
+    ttk.Label(frame, text="Disco Destino:").grid(row=2, column=0, sticky='e', pady=10, padx=10)
+    lista_destino = ttk.Combobox(frame, width=55, state="readonly")
+    lista_destino.grid(row=2, column=1, pady=10, padx=10, sticky='w')
 
-    clonar_button = tk.Button(
-        frame_boton, text="Iniciar Clonación", command=iniciar_clonacion,
-        width=20, font=("Arial", 12), bg="#2196F3", fg="white", relief="flat"
-    )
-    clonar_button.pack(pady=10)  # Botón para iniciar la clonación
+    # Botones en un frame centrado
+    frame_botones = ttk.Frame(frame, style='My.TFrame')
+    frame_botones.grid(row=3, column=0, columnspan=2, pady=25, sticky='ew')
+    frame_botones.columnconfigure(0, weight=1)
+    frame_botones.columnconfigure(1, weight=1)
 
-    ventana.mainloop()  # Inicia el bucle principal de la interfaz gráfica
+    btn_clonar = ttk.Button(frame_botones, text="Clonar", command=iniciar_clonacion, style='Green.TButton')
+    btn_clonar.grid(row=0, column=0, padx=20, sticky='e')
+
+    btn_actualizar = ttk.Button(frame_botones, text="Actualizar", command=actualizar_listas)
+    btn_actualizar.grid(row=0, column=1, padx=20, sticky='w')
+
+    # Separador visual
+    sep = ttk.Separator(frame, orient='horizontal')
+    sep.grid(row=4, column=0, columnspan=2, sticky='ew', pady=10)
+
+    # Pie de página y advertencia
+    ttk.Label(
+        frame,
+        text="Advertencia: ¡Todos los datos del disco destino serán eliminados!",
+        style='Warning.TLabel',
+        anchor='center',
+        justify='center'
+    ).grid(row=5, column=0, columnspan=2, pady=(10, 0), sticky='ew')
+
+    ttk.Label(
+        frame,
+        text="Utilice esta herramienta con precaución. Requiere permisos de administrador.",
+        font=('Segoe UI', 10),
+        anchor='center',
+        justify='center'
+    ).grid(row=6, column=0, columnspan=2, pady=(5, 0), sticky='ew')
+
+    # Inicializar listas
+    actualizar_listas()
+
+    ventana.mainloop()
 
 if __name__ == "__main__":
+    # Requiere administrador
+    if not ctypes.windll.shell32.IsUserAnAdmin():
+        print("Debes ejecutar este programa como administrador.")
+        messagebox.showerror("Permisos", "Ejecutar como administrador")
+        input("Presiona Enter para salir...")
+        sys.exit(1)
     crear_interfaz()

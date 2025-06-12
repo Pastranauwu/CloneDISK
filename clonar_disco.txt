@@ -1,0 +1,6 @@
+select volume C
+clean
+create partition primary
+format fs=ntfs quick
+assign letter=E
+exit
